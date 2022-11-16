@@ -1,0 +1,151 @@
+name: Build and Deploy
+
+on:
+  workflow_call:
+    inputs:
+      githubEnvironment:
+        description: 'The identifier for the GitHub environment that contains environment-specific secrets.'
+        type: string
+        required: true
+
+    secrets:
+      EXP_ENVIRONMENT:
+        description: 'Identifier for the environment name in AWS (e.g. included in the Secrets Manager name)'
+        required: true
+      EXP_NAMESPACE:
+        description: 'Identifier of the ExP project without the exp- prefix. Eg(exp-management has a namespace of management'
+        required: true
+      AWS_ACCESS_KEY_ID:
+        required: true
+      AWS_SECRET_ACCESS_KEY:
+        required: true
+      AWS_ACCOUNT_ID:
+        required: true
+      AWS_SECRET_NAME_INFRASTRUCTURE:
+        required: true
+      NPM_TOKEN:
+        required: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ inputs.githubEnvironment }}
+    steps:
+      - run: echo "Building using githubEnvironment - ${{ inputs.githubEnvironment }}"
+
+      - uses: actions/checkout@v3
+
+      - uses: actions/setup-node@v3
+        with:
+          node-version: 16
+          cache: 'yarn'
+
+      - name: Authenticating with AWS
+        uses: aws-actions/configure-aws-credentials@v1-node16
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-southeast-2
+
+      - name: Injecting Code Artifact credentials
+        run: aws codeartifact login --tool npm --domain firemark-exp --domain-owner ${{ secrets.AWS_ACCOUNT_ID }} --repository iag-exp-platform --debug --namespace @exp
+
+      - name: Configure NPM
+        run: |
+          echo "@weareroam:registry=https://registry.npmjs.org/" >> ./.npmrc
+          echo "//registry.npmjs.org/:_authToken=${{ secrets.NPM_TOKEN }}" >> ./.npmrc
+          cat ~/.npmrc >> .npmrc
+          for i in $(find ./packages -mindepth 1 -maxdepth 1 -type d); do cp .npmrc $i/.npmrc; done
+
+      - name: Install dependencies
+        run: |
+          yarn install
+          yarn lerna bootstrap
+
+      - name: Get secrets from Secrets Manager
+        id: secrets-manager
+        env:
+          AWS_SECRET_NAME_INFRASTRUCTURE: ${{ secrets.AWS_SECRET_NAME_INFRASTRUCTURE }}
+        run: |
+          # Get infra secrets
+          aws secretsmanager get-secret-value --secret-id $AWS_SECRET_NAME_INFRASTRUCTURE \
+            | jq '.SecretString | fromjson ' > /tmp/secrets_infra.json
+
+          PROJECT_SECRETS_NAME=$(cat /tmp/secrets_infra.json | jq '.SECRETS_MANAGER_PROJECT_ARN')
+
+          PROJECT_SECRETS=$(echo $PROJECT_SECRETS_NAME | xargs aws secretsmanager get-secret-value --secret-id)
+
+          # Get project secrets & put into a temp JSON file for Dockerfile to read in
+          echo $PROJECT_SECRETS \
+            | jq -r '.SecretString' \
+            > /tmp/exp_secrets.json
+
+          # Write project secrets to env file for UI build
+          echo $PROJECT_SECRETS \
+            | jq -r '.SecretString | fromjson | to_entries[] | ["export " + .key,(.value|@sh)] | join("=")' \
+            > /tmp/project_env
+
+          ###
+          # TODO: Test printing envs above directly into $GITHUB_OUTPUT
+          ###
+
+          echo "PROJECT_SECRETS_NAME=$PROJECT_SECRETS_NAME" >> $GITHUB_OUTPUT
+
+          S3_BUCKET=$(cat /tmp/secrets_infra.json | jq -r '.S3_BUCKET_ID')
+          echo "S3_BUCKET=$S3_BUCKET" >> $GITHUB_OUTPUT
+
+          CLOUDFRONT_DIST_ID=$(cat /tmp/secrets_infra.json | jq -r '.CLOUDFRONT_DISTRIBUTION_ID')
+          echo "CLOUDFRONT_DIST_ID=$CLOUDFRONT_DIST_ID" >> $GITHUB_OUTPUT
+
+      - name: Build all packages
+        run: |
+          source /tmp/project_env
+
+          export REACT_APP_COMMIT_HASH=$(git show-ref --head --hash head)
+
+          yarn lerna run build
+
+      - name: Frontend S3 Sync
+        uses: lbertenasco/s3-deploy@v1
+        with:
+          folder: 'packages/frontend/build'
+          bucket: ${{ steps.secrets-manager.outputs.S3_BUCKET }}
+          dist-id: ${{ steps.secrets-manager.outputs.CLOUDFRONT_DIST_ID }}
+          invalidation: '/*'
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Build and deploy Backend to Amazon ECR
+        id: build-deploy-be-ecr
+        run: |
+          ECR_REPO=$(cat /tmp/secrets_infra.json | jq -r '.ECR_REPOSITORY_NAME')
+          IMAGE_ID=${{ steps.login-ecr.outputs.registry }}/$ECR_REPO:${{ github.sha }}
+          echo $IMAGE_ID
+
+          cd packages/backend
+
+          # Copy envs locally to put into docker context
+          cp -v /tmp/exp_secrets.json .
+
+          docker build \
+            --build-arg NPM_TOKEN=${{ secrets.NPM_TOKEN }} \
+            --build-arg SAUCE_ENVIRONMENT_SECRET_ID=${{ steps.secrets-manager.outputs.PROJECT_SECRETS_NAME }} \
+            --build-arg AWS_DEFAULT_REGION=${{ env.AWS_DEFAULT_REGION }} \
+            --build-arg AWS_ACCESS_KEY_ID=${{ env.AWS_ACCESS_KEY_ID }} \
+            --build-arg AWS_SECRET_ACCESS_KEY=${{ env.AWS_SECRET_ACCESS_KEY }} \
+            --build-arg EXP_SECRETS_FILE=exp_secrets.json \
+            -t $IMAGE_ID .
+
+          docker push $IMAGE_ID
+          echo "IMAGE_ID=$IMAGE_ID" >> $GITHUB_OUTPUT
+
+      - name: Deploy ECR to EKS
+        run: |
+          aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name exp-${{ secrets.EXP_ENVIRONMENT }}
+          kubectl set image \
+            deployment/exp-${{ secrets.EXP_ENVIRONMENT }}-${{ secrets.EXP_NAMESPACE }} \
+            exp-${{ secrets.EXP_ENVIRONMENT }}-${{ secrets.EXP_NAMESPACE }}=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ steps.build-deploy-be-ecr.outputs.IMAGE_ID }} \
+            -n exp-${{ secrets.EXP_ENVIRONMENT }}-${{ secrets.EXP_NAMESPACE }}-fargate
