@@ -4,16 +4,16 @@ on:
   workflow_call:
     inputs:
       githubEnvironment:
-        description: 'The identifier for the GitHub environment that contains environment-specific secrets.'
+        description: "The identifier for the GitHub environment that contains environment-specific secrets."
         type: string
         required: true
 
     secrets:
       EXP_ENVIRONMENT:
-        description: 'Identifier for the environment name in AWS (e.g. included in the Secrets Manager name)'
+        description: "Identifier for the environment name in AWS (e.g. included in the Secrets Manager name)"
         required: true
       EXP_NAMESPACE:
-        description: 'Identifier of the ExP project without the exp- prefix. Eg(exp-management has a namespace of management'
+        description: "Identifier of the ExP project without the exp- prefix. Eg(exp-management has a namespace of management"
         required: true
       AWS_ACCESS_KEY_ID:
         required: true
@@ -39,7 +39,7 @@ jobs:
       - uses: actions/setup-node@v3
         with:
           node-version: 16
-          cache: 'yarn'
+          cache: "yarn"
 
       - name: Authenticating with AWS
         uses: aws-actions/configure-aws-credentials@v1-node16
@@ -109,10 +109,10 @@ jobs:
       - name: Frontend S3 Sync
         uses: lbertenasco/s3-deploy@v1
         with:
-          folder: 'packages/frontend/build'
+          folder: "packages/frontend/build"
           bucket: ${{ steps.secrets-manager.outputs.S3_BUCKET }}
           dist-id: ${{ steps.secrets-manager.outputs.CLOUDFRONT_DIST_ID }}
-          invalidation: '/*'
+          invalidation: "/*"
 
       - name: Login to Amazon ECR
         id: login-ecr
@@ -147,5 +147,5 @@ jobs:
           aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name exp-${{ secrets.EXP_ENVIRONMENT }}
           kubectl set image \
             deployment/exp-${{ secrets.EXP_ENVIRONMENT }}-${{ secrets.EXP_NAMESPACE }} \
-            exp-${{ secrets.EXP_ENVIRONMENT }}-${{ secrets.EXP_NAMESPACE }}=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ steps.build-deploy-be-ecr.outputs.IMAGE_ID }} \
+            exp-${{ secrets.EXP_ENVIRONMENT }}-${{ secrets.EXP_NAMESPACE }}=${{ steps.build-deploy-be-ecr.outputs.IMAGE_ID }} \
             -n exp-${{ secrets.EXP_ENVIRONMENT }}-${{ secrets.EXP_NAMESPACE }}-fargate
